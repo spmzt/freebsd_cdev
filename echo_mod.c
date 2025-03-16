@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/malloc.h>
+#include <sys/fcntl.h>
 // #include <string.h>
 
 #include "echo_mod.h"
@@ -20,6 +21,65 @@ struct echodev_softc {
 };
 
 MALLOC_DEFINE(M_ECHODEV, "echodev", "Buffers to echodev");
+
+static int
+echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+	int error;
+
+	switch (cmd) {
+	case ECHODEV_GBUFSIZE:
+	{
+		sx_slock(&sc->lock);
+		*(size_t *)data = sc->len;
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
+	}
+	case ECHODEV_SBUFSIZE:
+	{
+		size_t new_len;
+
+		if ((fflag & FWRITE) == 0) {
+			error = EPERM;
+			break;
+		}
+		
+		new_len = *(size_t *)data;
+		sx_slock(&sc->lock);
+		if (new_len == sc->len) {
+			// nothing to do
+		} else if (new_len < sc->len) {
+			sc->len = new_len;
+		} else {
+			sc->buf = reallocf(sc->buf, new_len, M_ECHODEV, M_WAITOK | M_ZERO);
+			sc->len = new_len;
+		}
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
+	}
+	case ECHODEV_CLEAR:
+	{
+		if ((fflag & FWRITE) == 0) {
+			error = EPERM;
+			break;
+		}
+		
+		sx_slock(&sc->lock);
+		memset(sc->buf, 0, sc->len);
+		sx_sunlock(&sc->lock);
+		
+		error = 0;
+		break;
+	}
+	default:
+		error = ENOTTY;
+		break;
+	}
+	return (error);
+}
 
 static int
 echo_read(struct cdev *dev, struct uio *uio, int ioflag)
@@ -65,7 +125,8 @@ static struct cdevsw echo_cdevsw = {
 	.d_version =	D_VERSION,
 	.d_name =		"echo",
 	.d_read =		&echo_read,
-	.d_write =		&echo_write
+	.d_write =		&echo_write,
+	.d_ioctl =		&echo_ioctl
 };
 
 static int
