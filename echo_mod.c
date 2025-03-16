@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/malloc.h>
+// #include <string.h>
 
 #include "echo_mod.h"
 
@@ -15,6 +16,7 @@ struct echodev_softc {
 	char *buf;
 	size_t len;
 	struct sx lock;
+	size_t valid;
 };
 
 MALLOC_DEFINE(M_ECHODEV, "echodev", "Buffers to echodev");
@@ -30,8 +32,12 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 		return (0);
 
 	sx_slock(&sc->lock);
-	todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
-	error = uiomove(sc->buf + uio->uio_offset, todo, uio);
+	todo = MIN(uio->uio_resid, sc->valid);
+	error = uiomove(sc->buf, todo, uio);
+	if (error == 0) {
+		sc->valid -= todo;
+		memmove(sc->buf, sc->buf + todo, sc->valid);
+	}
 	sx_sunlock(&sc->lock);
 	return (error);
 }
@@ -47,8 +53,10 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 			return (EFBIG);
 
 	sx_xlock(&sc->lock);
-	todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
-	error = uiomove(sc->buf + uio->uio_offset, todo, uio);
+	todo = MIN(uio->uio_resid, sc->len - sc->valid);
+	error = uiomove(sc->buf + sc->valid, todo, uio);
+	if (error == 0)
+		sc->valid += todo;
 	sx_xunlock(&sc->lock);
 	return (error);
 }
