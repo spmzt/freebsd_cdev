@@ -8,7 +8,8 @@
 #include <sys/uio.h>
 #include <sys/malloc.h>
 #include <sys/fcntl.h>
-// #include <string.h>
+#include <sys/systm.h>
+#include <sys/proc.h>
 
 #include "echo_mod.h"
 
@@ -18,6 +19,7 @@ struct echodev_softc {
 	size_t len;
 	struct sx lock;
 	size_t valid;
+	bool dying;
 };
 
 MALLOC_DEFINE(M_ECHODEV, "echodev", "Buffers to echodev");
@@ -88,17 +90,33 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	size_t todo = 0;
 	int error;
 
-	if (uio->uio_offset >= sc->len)
+	if (uio->uio_resid == 0)
 		return (0);
 
-	sx_slock(&sc->lock);
+	sx_xlock(&sc->lock);
+
+	/* wait for bytes to read */
+	while (sc->valid == 0) {
+		if (sc->dying == true)
+			error = ENXIO;
+		else
+			error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
+		if (error != 0) {
+			sx_xunlock(&sc->lock);
+			return (error);
+		}	
+	}
+
 	todo = MIN(uio->uio_resid, sc->valid);
 	error = uiomove(sc->buf, todo, uio);
 	if (error == 0) {
+		if (sc->valid == sc->len)
+			wakeup(sc);
 		sc->valid -= todo;
 		memmove(sc->buf, sc->buf + todo, sc->valid);
 	}
-	sx_sunlock(&sc->lock);
+
+	sx_xunlock(&sc->lock);
 	return (error);
 }
 
@@ -161,11 +179,17 @@ echodev_load(struct echodev_softc **scp, size_t len)
 static int
 echodev_unload(struct echodev_softc *sc, size_t len)
 {
-	if (sc != NULL) {
+	if (sc->dev != NULL) {
+			sx_xlock(&sc->lock);
+			sc->dying = true;
+			wakeup(sc);
+			sx_xunlock(&sc->lock);
+
 			destroy_dev(sc->dev);
-			sx_destroy(&sc->lock);
-			free(sc, M_ECHODEV);
 	}
+	free(sc->buf, M_ECHODEV);
+	sx_destroy(&sc->lock);
+	free(sc, M_ECHODEV);
 	return (0);
 }
 
