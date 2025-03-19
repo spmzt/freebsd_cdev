@@ -8,8 +8,10 @@
 #include <sys/uio.h>
 #include <sys/malloc.h>
 #include <sys/fcntl.h>
+#include <sys/filio.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/limits.h>
 
 #include "echo_mod.h"
 
@@ -20,6 +22,7 @@ struct echodev_softc {
 	struct sx lock;
 	size_t valid;
 	bool dying;
+	uint32_t writers;
 };
 
 MALLOC_DEFINE(M_ECHODEV, "echodev", "Buffers to echodev");
@@ -31,6 +34,15 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread 
 	int error;
 
 	switch (cmd) {
+	case FIONBIO:
+		error = 0;
+		break;
+	case FIOASYNC:
+		if (*(int *)data != 0)
+			error = EINVAL;
+		else
+			error = 0;
+		break;
 	case ECHODEV_GBUFSIZE:
 	{
 		sx_slock(&sc->lock);
@@ -84,6 +96,39 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread 
 }
 
 static int
+echo_open(struct cdev *dev, int oflag, int devtype, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+
+	if ((oflag & FWRITE) != 0) {
+		sx_xlock(&sc->lock);
+		if (sc->writers == UINT_MAX) {
+			sx_xunlock(&sc->lock);
+			return (EBUSY);
+		}
+		sc->writers++;
+		sx_xunlock(&sc->lock);
+	}
+	return (0);
+}
+
+static int
+echo_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+
+	if ((fflag & FWRITE) != 0) {
+		sx_xlock(&sc->lock);
+		sc->writers--;
+		if (sc->writers == 0) {
+			wakeup(sc);
+		}
+		sx_xunlock(&sc->lock);
+	}
+	return (0);
+}
+
+static int
 echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 {
 	struct echodev_softc *sc = dev->si_drv1;
@@ -96,9 +141,11 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	sx_xlock(&sc->lock);
 
 	/* wait for bytes to read */
-	while (sc->valid == 0) {
+	while (sc->valid == 0 && sc->writers != 0) {
 		if (sc->dying == true)
 			error = ENXIO;
+		else if (ioflag & O_NONBLOCK)
+			error = EWOULDBLOCK;
 		else
 			error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
 		if (error != 0) {
@@ -135,6 +182,7 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 	error = uiomove(sc->buf + sc->valid, todo, uio);
 	if (error == 0)
 		sc->valid += todo;
+	wakeup(sc);
 	sx_xunlock(&sc->lock);
 	return (error);
 }
@@ -142,6 +190,8 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 static struct cdevsw echo_cdevsw = {
 	.d_version =	D_VERSION,
 	.d_name =		"echo",
+	.d_open =		&echo_open,
+	.d_close =		&echo_close,
 	.d_read =		&echo_read,
 	.d_write =		&echo_write,
 	.d_ioctl =		&echo_ioctl
