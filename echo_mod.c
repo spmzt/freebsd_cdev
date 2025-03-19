@@ -9,9 +9,11 @@
 #include <sys/malloc.h>
 #include <sys/fcntl.h>
 #include <sys/filio.h>
+#include <sys/selinfo.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
 #include <sys/limits.h>
+#include <sys/poll.h>
 
 #include "echo_mod.h"
 
@@ -20,6 +22,8 @@ struct echodev_softc {
 	char *buf;
 	size_t len;
 	struct sx lock;
+	struct selinfo rsel;
+	struct selinfo wsel;
 	size_t valid;
 	bool dying;
 	uint32_t writers;
@@ -34,6 +38,18 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread 
 	int error;
 
 	switch (cmd) {
+	case FIONREAD:
+		sx_slock(&sc->lock);
+		*(int *)data = MIN(INT_MAX, sc->valid);
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
+	case FIONWRITE:
+		sx_slock(&sc->lock);
+		*(int *)data = MIN(INT_MAX, sc->len - sc->valid);
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
 	case FIONBIO:
 		error = 0;
 		break;
@@ -44,22 +60,18 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread 
 			error = 0;
 		break;
 	case ECHODEV_GBUFSIZE:
-	{
 		sx_slock(&sc->lock);
 		*(size_t *)data = sc->len;
 		sx_sunlock(&sc->lock);
 		error = 0;
 		break;
-	}
 	case ECHODEV_SBUFSIZE:
 	{
 		size_t new_len;
-
 		if ((fflag & FWRITE) == 0) {
 			error = EPERM;
 			break;
 		}
-		
 		new_len = *(size_t *)data;
 		sx_slock(&sc->lock);
 		if (new_len == sc->len) {
@@ -75,24 +87,42 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread 
 		break;
 	}
 	case ECHODEV_CLEAR:
-	{
 		if ((fflag & FWRITE) == 0) {
 			error = EPERM;
 			break;
 		}
-		
 		sx_slock(&sc->lock);
 		memset(sc->buf, 0, sc->len);
 		sx_sunlock(&sc->lock);
-		
 		error = 0;
 		break;
-	}
 	default:
 		error = ENOTTY;
 		break;
 	}
 	return (error);
+}
+
+static int
+echo_poll(struct cdev *dev, int events, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+	int revents;
+
+	revents = 0;
+	sx_slock(&sc->lock);
+	if (sc->valid != 0 || sc->writers == 0)
+		revents |= events & (POLLIN | POLLRDNORM);
+	if (sc->valid < sc->len)
+		revents |= events & (POLLOUT | POLLWRNORM);
+	if (revents == 0) {
+		if ((events & (POLLIN | POLLRDNORM)) != 0)
+			selrecord(td, &sc->rsel);
+		if ((events & (POLLOUT | POLLWRNORM)) != 0)
+			selrecord(td, &sc->wsel);
+	}
+	sx_sunlock(&sc->lock);
+	return (revents);
 }
 
 static int
@@ -161,6 +191,7 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 			wakeup(sc);
 		sc->valid -= todo;
 		memmove(sc->buf, sc->buf + todo, sc->valid);
+		selwakeup(&sc->wsel);
 	}
 
 	sx_xunlock(&sc->lock);
@@ -194,7 +225,8 @@ static struct cdevsw echo_cdevsw = {
 	.d_close =		&echo_close,
 	.d_read =		&echo_read,
 	.d_write =		&echo_write,
-	.d_ioctl =		&echo_ioctl
+	.d_ioctl =		&echo_ioctl,
+	.d_poll =		&echo_poll
 };
 
 static int

@@ -1,10 +1,12 @@
 #include <sys/ioctl.h>
+#include <sys/poll.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <err.h>
 #include <unistd.h>
+#include <sysdecode.h>
 
 #include <echo_mod.h>
 
@@ -15,6 +17,7 @@ usage(void)
 			"\n"
 			"where command in one of:\n"
 			"\tclear\t\t- clear buffer constants\n"
+			"\tpoll [-rwW]\t- display I/O status\n"
 			"\tresize <size>\t- set buffer size\n"
 			"\tsize\t\t- display buffer size\n");
 	exit(1);
@@ -81,6 +84,67 @@ resize(int argc, char **argv)
 	close(fd);
 }
 
+static void
+status(int argc, char **argv)
+{
+	struct pollfd pfd;
+	int ch, count, events, fd;
+	bool wait;
+
+	argc--;
+	argv++;
+
+	events = 0;
+	wait = false;
+	while ((ch = getopt(argc, argv, "rwW")) != -1) {
+		switch(ch) {
+		case 'r':
+			events |= POLLIN;
+			break;
+		case 'w':
+			events |= POLLOUT;
+			break;
+		case 'W':
+			wait = true;
+			break;
+		default:
+			usage();
+		}
+	}
+
+	argc -= optind;
+	argv += optind;
+
+	if (argc != 0)
+		usage();
+
+	if (events == 0)
+		events = POLLIN | POLLOUT;
+
+	fd = open_device(O_RDONLY);
+	pfd.fd = fd;
+	pfd.events = events;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, wait ? INFTIM : 0) == -1)
+		err(1, "poll");
+
+	printf("Returned events: ");
+	if (!sysdecode_pollfd_events(stdout, pfd.revents, NULL))
+		printf("<none>");
+	printf("\n");
+	if (pfd.revents & POLLIN) {
+		if (ioctl(fd, FIONREAD, &count) == -1)
+			err(1, "ioctl(FIONREAD)");
+		printf("%d available to read.\n", count);
+	}
+	if (pfd.revents & POLLOUT) {
+		if (ioctl(fd, FIONWRITE, &count) == -1)
+			err(1, "ioctl(FIONWRITE)");
+		printf("%d available to write.\n", count);
+	}
+	close(fd);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -93,6 +157,8 @@ main(int argc, char **argv)
 		size(argc, argv);
 	else if (strcmp(argv[1], "resize") == 0)
 		resize(argc, argv);
+	else if (strcmp(argv[1], "poll") == 0)
+		status(argc, argv);
 	else
 		usage();
 
